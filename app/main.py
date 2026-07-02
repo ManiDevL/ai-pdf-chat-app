@@ -1,6 +1,6 @@
 import streamlit as st
 
-from llm_chat import ask_llm
+from rag_pipeline import answer_question_with_rag
 from pdf_processing import extract_text_from_pdf
 
 
@@ -23,8 +23,8 @@ if uploaded_file is not None:
     question = st.text_input("Ask a question about the PDF")
 
     if question:
-        with st.spinner("Generating answer with SAIA/Gemma..."):
-            answer = ask_llm(question, extracted_text)
+        with st.spinner("Searching relevant PDF sections and generating answer with SAIA/Gemma..."):
+            answer = answer_question_with_rag(question, extracted_text)
 
         st.subheader("Answer")
         st.write(answer)
