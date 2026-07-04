@@ -1,6 +1,9 @@
+pymupdf
 streamlit
 pypdf
 langchain
 chromadb
 openai
 python-dotenv
+pillow
+sentence-transformers
