@@ -10,7 +10,7 @@ import chromadb
 from dotenv import load_dotenv, find_dotenv
 from openai import OpenAI
 
-from pdf_processing import CHROMA_DIR, DB_WRITE_LOCK, IMAGE_DIR, get_collection
+from pdf_processing import CHROMA_DIR, DB_WRITE_LOCK, IMAGE_DIR, embed_query, get_collection
 
 # Lade Umgebungsvariablen
 load_dotenv(find_dotenv(), override=True)
@@ -29,8 +29,8 @@ SUMMARY_KEYWORDS = (
 
 # Wie viele Zeichen Dokumenttext pro Map-Aufruf zusammengefasst werden
 SUMMARY_BATCH_CHARS = 15000
-# Parallele LLM-Aufrufe beim Map-Schritt
-SUMMARY_MAX_WORKERS = 4
+# Parallele LLM-Aufrufe beim Map-Schritt (höher = schneller, solange der Endpoint es mitmacht)
+SUMMARY_MAX_WORKERS = 8
 
 # Retrieval: erst breit suchen, dann mit dem Cross-Encoder präzise nachsortieren
 RETRIEVAL_CANDIDATES = 20   # Kandidaten aus der Vektorsuche vor dem Re-Ranking
@@ -65,6 +65,20 @@ def is_summary_question(question: str) -> bool:
 # Welche Dokumente werden gerade im Hintergrund mit Bildbeschreibungen indexiert.
 # Rein informativ für die UI (Sidebar-Hinweis "Bilder werden noch beschrieben...").
 _image_indexing_in_progress: set[str] = set()
+
+# Dasselbe für die Dokument-Zusammenfassung, plus ein Lock pro Dokument: verhindert,
+# dass eine im Hintergrund gestartete Zusammenfassung (siehe ensure_document_summary)
+# und eine parallel im Chat angefragte Zusammenfassung (answer()) doppelt rechnen.
+_summary_indexing_in_progress: set[str] = set()
+_summary_locks: dict[str, threading.Lock] = {}
+_summary_locks_guard = threading.Lock()
+
+
+def _get_summary_lock(source: str) -> threading.Lock:
+    with _summary_locks_guard:
+        if source not in _summary_locks:
+            _summary_locks[source] = threading.Lock()
+        return _summary_locks[source]
 
 _reranker = None
 
@@ -160,7 +174,7 @@ class GWDGRagPipeline:
             return []
 
         results = self.collection.query(
-            query_texts=[question],
+            query_embeddings=[embed_query(question)],
             n_results=min(RETRIEVAL_CANDIDATES, total),
             where=self._where_filter(source, ["text", "image"]),
         )
@@ -402,11 +416,48 @@ class GWDGRagPipeline:
         return result
 
     def build_document_summary(self, source: str) -> str | None:
+        """Öffentlicher Einstiegspunkt: liefert die Zusammenfassung, baut sie falls nötig.
+
+        Lock-geschützt pro Dokument, damit ein im Hintergrund laufender Aufbau
+        (ensure_document_summary, direkt nach dem Upload gestartet) und eine parallel
+        im Chat gestellte Summary-Frage (answer()) nicht doppelt rechnen: der zweite
+        Aufrufer wartet einfach am Lock und bekommt danach die bereits fertige Summary.
+        """
+        lock = _get_summary_lock(source)
+        with lock:
+            existing = self._get_stored_summaries(source)
+            if existing:
+                return existing[0][1]
+
+            _summary_indexing_in_progress.add(source)
+            try:
+                return self._compute_document_summary(source)
+            finally:
+                _summary_indexing_in_progress.discard(source)
+
+    def is_indexing_summary(self, source: str) -> bool:
+        """Ob für dieses Dokument gerade im Hintergrund eine Zusammenfassung entsteht."""
+        return source in _summary_indexing_in_progress
+
+    def ensure_document_summary(self, source: str) -> bool:
+        """Stößt die Dokument-Zusammenfassung im Hintergrund an, falls noch nicht vorhanden.
+
+        Wird direkt nach dem Upload aufgerufen (wie ensure_document_images), damit die
+        teure Map-Reduce-Zusammenfassung schon während/nach dem Upload im Hintergrund
+        läuft statt erst zu starten, wenn der Nutzer im Chat danach fragt.
+        """
+        if self.is_indexing_summary(source) or self._get_stored_summaries(source):
+            return False
+
+        thread = threading.Thread(target=self.build_document_summary, args=(source,), daemon=True)
+        thread.start()
+        return True
+
+    def _compute_document_summary(self, source: str) -> str | None:
         """Erzeugt per Map-Reduce eine Gesamtzusammenfassung eines Dokuments
         und speichert sie als Summary-Chunk in der Collection.
 
-        Wird einmal beim Ingest aufgerufen; globale Fragen wie "Summarize the report"
-        werden später direkt aus dieser Zusammenfassung beantwortet.
+        Reines Rechnen ohne Locking/Dedup - nur über build_document_summary aufrufen.
         """
         data = self.collection.get(
             where=self._where_filter(source, ["text"]),
@@ -642,13 +693,13 @@ class GWDGRagPipeline:
         history = history or []
 
         if is_summary_question(question):
-            # Zusammenfassungen werden bewusst NICHT beim Upload erzeugt (das würde den
-            # Chat unnötig blockieren), sondern erst hier, beim ersten tatsächlichen Bedarf.
-            # Einmal gebaut, bleiben sie gespeichert und werden nur noch abgerufen.
+            # ensure_document_summary() startet die Zusammenfassung meist schon im
+            # Hintergrund direkt nach dem Upload. build_document_summary() ist lock-
+            # geschützt und dedupliziert: läuft der Hintergrund-Build noch, wartet dieser
+            # Aufruf einfach darauf, statt ein zweites Mal zu rechnen.
             sources_to_summarize = [source] if source else self.list_sources()
             for doc_source in sources_to_summarize:
-                if not self._get_stored_summaries(doc_source):
-                    self.build_document_summary(doc_source)
+                self.build_document_summary(doc_source)
 
             summaries = self._get_stored_summaries(source)
             if summaries:

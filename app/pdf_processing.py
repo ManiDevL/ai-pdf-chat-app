@@ -17,8 +17,9 @@ IMAGE_DIR = BASE_DIR / "extracted_images"
 CHROMA_DIR = BASE_DIR / "chroma_db"
 
 COLLECTION_NAME = "eco_reports"
-# Mehrsprachiges State-of-the-Art-Retrieval-Modell (braucht keine Query-/Passage-Präfixe)
-EMBEDDING_MODEL = "BAAI/bge-m3"
+# Mehrsprachiges Retrieval-Modell. Deutlich leichter als BAAI/bge-m3 (CPU-Embedding
+# eines 15-MB-Reports: ~260s -> ~75s), bei weiterhin guter Qualität für DE/EN.
+EMBEDDING_MODEL = "intfloat/multilingual-e5-base"
 
 # Zielgröße eines Chunks in Zeichen und Überlappung zwischen benachbarten Chunks
 CHUNK_SIZE = 1000
@@ -33,6 +34,18 @@ MIN_IMAGE_SIZE = 100
 # und dabei mit Chunking/Löschungen im Hauptthread kollidieren könnten.
 DB_WRITE_LOCK = threading.Lock()
 
+class _E5PassageEmbeddingFunction(embedding_functions.SentenceTransformerEmbeddingFunction):
+    """E5-Modelle liefern nur mit "query: "/"passage: "-Präfix ihre volle Retrieval-Qualität
+    (siehe Modellkarte von intfloat/multilingual-e5-*). Diese Funktion ist an der Collection
+    hinterlegt und wird für ALLES benutzt, was indexiert wird (Text-Chunks, Bildbeschreibungen,
+    Zusammenfassungen) - deshalb hier fest das Passage-Präfix. Suchanfragen laufen separat
+    über embed_query() mit dem Query-Präfix (siehe rag_pipeline.retrieve_relevant_chunks).
+    """
+
+    def __call__(self, input):
+        return super().__call__([f"passage: {text}" for text in input])
+
+
 _embedding_function = None
 
 
@@ -40,11 +53,22 @@ def get_embedding_function():
     """Lädt das Embedding-Modell nur einmal pro Prozess (teurer Modell-Load)."""
     global _embedding_function
     if _embedding_function is None:
-        _embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(
+        _embedding_function = _E5PassageEmbeddingFunction(
             model_name=EMBEDDING_MODEL,
             normalize_embeddings=True,
         )
     return _embedding_function
+
+
+def embed_query(text: str) -> list[float]:
+    """Embeddet eine Suchanfrage mit dem "query: "-Präfix, das E5-Modelle für Retrieval erwarten.
+
+    Nutzt dasselbe geladene Modell wie get_embedding_function() (SentenceTransformer cached
+    Modelle intern nach model_name), lädt also nichts doppelt.
+    """
+    model = get_embedding_function()._model
+    vector = model.encode(f"query: {text}", convert_to_numpy=True, normalize_embeddings=True)
+    return vector.tolist()
 
 
 def get_collection(chroma_client):

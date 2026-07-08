@@ -90,6 +90,33 @@ def create_json_export(pipeline, source: str) -> dict:
     return {field: _as_string(data.get(field, "")) for field in EXPORT_FIELDS}
 
 
-def convert_json_export_to_string(export_data: dict) -> str:
+def convert_json_export_to_string(export_data: dict | list) -> str:
     """Serialisiert den Export formatiert für den Download-Button."""
     return json.dumps(export_data, indent=2, ensure_ascii=False)
+
+
+def create_chat_history_export(messages: list[dict]) -> list[dict]:
+    """Paart jede Nutzerfrage mit der direkt folgenden Assistenzantwort für den Export.
+
+    Nimmt st.session_state.messages entgegen (Liste aus {"role", "content", "sources"}).
+    """
+    turns = []
+    pending_question = None
+    for message in messages:
+        role = message.get("role")
+        content = message.get("content", "")
+        if role == "user":
+            pending_question = content
+        elif role == "assistant" and pending_question is not None:
+            turns.append(
+                {
+                    "question": pending_question,
+                    "answer": content,
+                    "sources": [
+                        {"source": entry.get("source"), "page": entry.get("page")}
+                        for entry in (message.get("sources") or [])
+                    ],
+                }
+            )
+            pending_question = None
+    return turns

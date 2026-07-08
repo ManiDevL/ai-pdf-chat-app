@@ -7,9 +7,14 @@ from pathlib import Path
 import streamlit as st
 
 
-from json_export import create_json_export, convert_json_export_to_string
+from json_export import create_json_export, convert_json_export_to_string, create_chat_history_export
 from pdf_processing import PDF_DIR, PDFProcessor
 from rag_pipeline import get_pipeline, is_summary_question
+
+
+# Vorgefertigte Frage für den Summary-Button: enthält "summar", damit is_summary_question()
+# sie zuverlässig erkennt, unabhängig von der Sprache des restlichen Chats.
+SUMMARY_BUTTON_QUESTION = "Please provide a summary of this document."
 
 
 # Sets the browser tab title, app icon, and page layout for the Streamlit UI.
@@ -237,6 +242,9 @@ if "active_source" not in st.session_state:
 
 if "just_deleted_source" not in st.session_state:
     st.session_state.just_deleted_source = None
+
+if "pending_question" not in st.session_state:
+    st.session_state.pending_question = None
 
 
 # Die RAG-Pipeline (LLM-Client, Vektor-DB, Embedding- und Reranker-Modelle) wird
@@ -475,12 +483,13 @@ def process_uploaded_pdf(uploaded_file) -> str:
 
     This is deliberately the ONLY blocking step. Chunking + embedding is fast
     (CPU-only, no LLM calls) and is enough to make the document immediately
-    chattable. Two more expensive steps are deferred:
-    - The document summary is built lazily, only when a summary question is
-      actually asked (see rag_pipeline.answer).
-    - Figure descriptions are generated in a background thread (see
-      pipeline.ensure_document_images), since each image needs its own
-      vision-model call and a chart-heavy report can have dozens of them.
+    chattable. Two more expensive steps are deferred to background threads:
+    - The document summary (see pipeline.ensure_document_summary), so the
+      Map-Reduce LLM calls happen while the user is still reading the upload
+      confirmation instead of blocking the first summary question in chat.
+    - Figure descriptions (see pipeline.ensure_document_images), since each
+      image needs its own vision-model call and a chart-heavy report can
+      have dozens of them.
     Older PDFs stay untouched in the index; they are not re-chunked on every upload.
     """
     st.session_state.page_texts = extract_page_texts_from_pdf(uploaded_file)
@@ -488,6 +497,7 @@ def process_uploaded_pdf(uploaded_file) -> str:
 
     stats = PDFProcessor().process_pdf(uploaded_file.name)
     pipeline.ensure_document_images(uploaded_file.name)
+    pipeline.ensure_document_summary(uploaded_file.name)
 
     return (
         f"'{uploaded_file.name}' was processed: {stats['chunks']} text chunks from "
@@ -591,6 +601,7 @@ with st.sidebar:
             st.session_state.uploaded_file_name = uploaded_file.name
             st.session_state.processing_status = f"'{uploaded_file.name}' is already indexed."
             pipeline.ensure_document_images(uploaded_file.name)
+            pipeline.ensure_document_summary(uploaded_file.name)
 
         st.success("PDF uploaded successfully.")
         st.markdown(
@@ -638,6 +649,8 @@ with st.sidebar:
             label = source_name
             if pipeline.is_indexing_images(source_name):
                 label += " · 🖼️ describing figures…"
+            if pipeline.is_indexing_summary(source_name):
+                label += " · 📋 summarizing…"
             name_column.caption(label)
             if delete_column.button("🗑️", key=f"delete_{source_name}", help=f"Delete {source_name}"):
                 PDFProcessor().delete_pdf(source_name)
@@ -681,6 +694,23 @@ with st.sidebar:
                 st.json(export["data"])
 
     st.divider()
+    st.subheader("💬 Chat Export")
+
+    if not st.session_state.messages:
+        st.caption("Ask a question first to enable chat export.")
+    else:
+        chat_export_payload = {
+            "document_scope": st.session_state.active_source or "All documents",
+            "chat_history": create_chat_history_export(st.session_state.messages),
+        }
+        st.download_button(
+            label="Download chat history JSON",
+            data=convert_json_export_to_string(chat_export_payload),
+            file_name="chat_history.json",
+            mime="application/json",
+        )
+
+    st.divider()
     st.caption("System status")
     st.markdown("<span class='status-badge'>Streamlit UI</span>", unsafe_allow_html=True)
     st.markdown("<span class='status-badge'>PDF Processing</span>", unsafe_allow_html=True)
@@ -715,6 +745,12 @@ else:
         unsafe_allow_html=True,
     )
 
+    #
+    # One-click summary: queues a ready-made summary question instead of requiring
+    # the user to type a keyword-triggered prompt like "summarize".
+    if st.button("🧾 Summarize this document"):
+        st.session_state.pending_question = SUMMARY_BUTTON_QUESTION
+
 
 #
 # Re-renders the stored chat history after every Streamlit rerun.
@@ -724,7 +760,11 @@ for message in st.session_state.messages:
 
 #
 # Creates the chat input field where the user asks questions about the uploaded PDF.
-user_question = st.chat_input("Ask a question about the PDF...")
+# A question can also come from the "Summarize this document" button above
+# (queued in st.session_state.pending_question); typing takes priority.
+typed_question = st.chat_input("Ask a question about the PDF...")
+user_question = typed_question or st.session_state.pending_question
+st.session_state.pending_question = None
 
 #
 # Handles a new user question: store it, query the RAG pipeline, render the answer, and save it to chat history.
@@ -739,7 +779,10 @@ if user_question:
         render_chat_bubble("user", user_question)
 
         if is_summary_question(user_question) and not pipeline.has_summary(st.session_state.active_source):
-            spinner_text = "Generating document summary (first time for this document, can take a bit)..."
+            if st.session_state.active_source and pipeline.is_indexing_summary(st.session_state.active_source):
+                spinner_text = "Finishing the document summary already generating in the background..."
+            else:
+                spinner_text = "Generating document summary (first time for this document, can take a bit)..."
         else:
             spinner_text = "Searching and re-ranking relevant PDF sections..."
 
