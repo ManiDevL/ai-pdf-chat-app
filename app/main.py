@@ -7,36 +7,9 @@ from pathlib import Path
 import streamlit as st
 
 
-try:
-    from pdf_processing import extract_text_from_pdf
-except ImportError:
-    extract_text_from_pdf = None
-
-try:
-    from pdf_processing import PDFProcessor
-except ImportError:
-    PDFProcessor = None
-
-try:
-    from rag_pipeline import answer_question_with_rag
-except ImportError:
-    answer_question_with_rag = None
-
-try:
-    from rag_pipeline import pipeline
-except ImportError:
-    pipeline = None
-
-try:
-    from rag_pipeline import GWDGRagPipeline
-except ImportError:
-    GWDGRagPipeline = None
-
-try:
-    from json_export import create_json_export, convert_json_export_to_string
-except ImportError:
-    create_json_export = None
-    convert_json_export_to_string = None
+from json_export import create_json_export, convert_json_export_to_string
+from pdf_processing import PDF_DIR, PDFProcessor
+from rag_pipeline import get_pipeline, is_summary_question
 
 
 # Sets the browser tab title, app icon, and page layout for the Streamlit UI.
@@ -243,8 +216,8 @@ st.markdown(
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-if "extracted_text" not in st.session_state:
-    st.session_state.extracted_text = ""
+if "processing_status" not in st.session_state:
+    st.session_state.processing_status = ""
 
 if "uploaded_file_name" not in st.session_state:
     st.session_state.uploaded_file_name = None
@@ -258,6 +231,27 @@ if "pdf_processed" not in st.session_state:
 
 if "page_texts" not in st.session_state:
     st.session_state.page_texts = {}
+
+if "active_source" not in st.session_state:
+    st.session_state.active_source = None
+
+if "just_deleted_source" not in st.session_state:
+    st.session_state.just_deleted_source = None
+
+
+# Die RAG-Pipeline (LLM-Client, Vektor-DB, Embedding- und Reranker-Modelle) wird
+# einmal pro Prozess geladen und über alle Streamlit-Reruns hinweg wiederverwendet.
+@st.cache_resource(show_spinner="Loading models and vector database...")
+def load_pipeline():
+    return get_pipeline()
+
+
+try:
+    pipeline = load_pipeline()
+    pipeline_error = None
+except Exception as e:
+    pipeline = None
+    pipeline_error = str(e)
 
 
 
@@ -308,11 +302,11 @@ def extract_page_numbers_from_answer(content: str) -> list[int]:
     (Source: report.pdf, Pages 2, 4, 8) -> [2, 4, 8]
     """
     content = clean_message_content(content)
-    source_matches = re.findall(r"\(Source:[^)]*\)", content)
+    source_matches = re.findall(r"\((?:Source|Quelle):[^)]*\)", content)
 
     page_numbers = []
     for source_match in source_matches:
-        page_sections = re.findall(r"Pages?\s+([0-9,\sand]+)", source_match, flags=re.IGNORECASE)
+        page_sections = re.findall(r"(?:Pages?|Seiten?):?\s+([0-9,\sand]+)", source_match, flags=re.IGNORECASE)
         for page_section in page_sections:
             page_numbers.extend(re.findall(r"\d+", page_section))
 
@@ -340,7 +334,7 @@ def split_answer_and_sources(content: str) -> tuple[str, str]:
     """
     content = clean_message_content(content)
     page_numbers = extract_page_numbers_from_answer(content)
-    cleaned_content = re.sub(r"\s*\(Source:[^)]*\)", "", content).strip()
+    cleaned_content = re.sub(r"\s*\((?:Source|Quelle):[^)]*\)", "", content).strip()
 
     if not page_numbers:
         return cleaned_content, ""
@@ -352,38 +346,80 @@ def split_answer_and_sources(content: str) -> tuple[str, str]:
 
 
 #
-# Renders each chat message and adds expandable source-page previews for assistant answers.
-def render_chat_bubble(role: str, content: str) -> None:
+# Renders each chat message and adds expandable source previews for assistant answers.
+def render_chat_bubble(role: str, content: str, sources: list | None = None) -> None:
     """
     Render chat messages with Streamlit's stable built-in chat component.
 
-    This avoids storing or rendering custom HTML as message content.
+    Assistant messages carry structured source metadata from the RAG pipeline
+    (document, page, relevance, optional figure image). Older messages without
+    metadata fall back to parsing the citation text.
     """
-    source_label = ""
     content = clean_message_content(content)
-    source_pages = []
 
-    if role == "assistant":
-        source_pages = extract_page_numbers_from_answer(content)
-        content, source_label = split_answer_and_sources(content)
-        avatar = "🌱"
+    if role != "assistant":
+        with st.chat_message(role, avatar="👤"):
+            st.write(content)
+        return
+
+    # Seitenangaben bevorzugt aus den echten Retrieval-Metadaten statt aus dem Antworttext
+    meta_pages = []
+    for entry in sources or []:
+        page = entry.get("page")
+        if page and page not in meta_pages:
+            meta_pages.append(page)
+    meta_pages.sort()
+
+    display_content, regex_label = split_answer_and_sources(content)
+    if meta_pages:
+        if len(meta_pages) == 1:
+            source_label = f"Page {meta_pages[0]}"
+        else:
+            source_label = "Pages " + ", ".join(str(page) for page in meta_pages)
     else:
-        avatar = "👤"
+        source_label = regex_label
 
-    with st.chat_message(role, avatar=avatar):
+    with st.chat_message("assistant", avatar="🌱"):
         if source_label:
             st.caption(f"📄 {source_label}")
-        st.write(content)
+        st.write(display_content)
 
-        if role == "assistant" and source_pages and st.session_state.page_texts:
-            with st.expander("Show source pages"):
-                for page_number in source_pages:
-                    page_text = st.session_state.page_texts.get(page_number, "")
-                    if page_text:
-                        with st.expander(f"Page {page_number}"):
-                            st.write(page_text)
+        if sources:
+            with st.expander("Show sources"):
+                for entry in sources:
+                    if entry.get("type") == "summary":
+                        st.caption(f"📋 Document summary: {entry.get('source')}")
                     else:
-                        st.caption(f"Page {page_number}: No extracted text available.")
+                        page = entry.get("page")
+                        page_end = entry.get("page_end") or page
+                        page_label = f"{page}-{page_end}" if page_end != page else f"{page}"
+                        icon = "🖼️" if entry.get("type") == "image" else "📄"
+                        score = entry.get("score")
+                        score_label = (
+                            f" · relevance {score:.0%}" if isinstance(score, (int, float)) else ""
+                        )
+                        st.caption(f"{icon} {entry.get('source')} – Page {page_label}{score_label}")
+
+                    image_path = entry.get("image_path")
+                    if image_path and Path(image_path).exists():
+                        st.image(image_path)
+
+                    entry_text = entry.get("text", "")
+                    if entry_text:
+                        st.write(entry_text[:600] + ("…" if len(entry_text) > 600 else ""))
+                    st.divider()
+        else:
+            # Fallback für ältere Nachrichten ohne gespeicherte Quellen-Metadaten
+            source_pages = extract_page_numbers_from_answer(content)
+            if source_pages and st.session_state.page_texts:
+                with st.expander("Show source pages"):
+                    for page_number in source_pages:
+                        page_text = st.session_state.page_texts.get(page_number, "")
+                        st.caption(f"Page {page_number}")
+                        if page_text:
+                            st.write(page_text[:1500])
+                        else:
+                            st.caption("No extracted text available.")
 
 #
 # Extracts text page by page from the uploaded PDF for the source-page preview feature.
@@ -424,10 +460,9 @@ def save_uploaded_pdf(uploaded_file) -> Path:
     The new PDFProcessor from the updated backend expects real files in ./pdfs,
     so the uploaded file has to be written to disk first.
     """
-    pdf_folder = Path("pdfs")
-    pdf_folder.mkdir(exist_ok=True)
+    PDF_DIR.mkdir(exist_ok=True)
 
-    pdf_path = pdf_folder / uploaded_file.name
+    pdf_path = PDF_DIR / uploaded_file.name
     pdf_path.write_bytes(uploaded_file.getbuffer())
     return pdf_path
 
@@ -436,52 +471,58 @@ def save_uploaded_pdf(uploaded_file) -> Path:
 # Processes a new PDF upload by extracting page text and preparing the RAG index.
 def process_uploaded_pdf(uploaded_file) -> str:
     """
-    Process the uploaded PDF with whichever backend version is currently available.
+    Process ONLY the newly uploaded PDF: chunk and index its text.
 
-    Compatibility paths:
-    1. Old backend: extract_text_from_pdf(uploaded_file)
-    2. New backend: save PDF to ./pdfs and call PDFProcessor().process_all_pdfs()
+    This is deliberately the ONLY blocking step. Chunking + embedding is fast
+    (CPU-only, no LLM calls) and is enough to make the document immediately
+    chattable. Two more expensive steps are deferred:
+    - The document summary is built lazily, only when a summary question is
+      actually asked (see rag_pipeline.answer).
+    - Figure descriptions are generated in a background thread (see
+      pipeline.ensure_document_images), since each image needs its own
+      vision-model call and a chart-heavy report can have dozens of them.
+    Older PDFs stay untouched in the index; they are not re-chunked on every upload.
     """
     st.session_state.page_texts = extract_page_texts_from_pdf(uploaded_file)
-    if extract_text_from_pdf is not None:
-        return extract_text_from_pdf(uploaded_file)
-
     save_uploaded_pdf(uploaded_file)
 
-    if PDFProcessor is not None:
-        processor = PDFProcessor()
-        if hasattr(processor, "process_all_pdfs"):
-            processor.process_all_pdfs()
+    stats = PDFProcessor().process_pdf(uploaded_file.name)
+    pipeline.ensure_document_images(uploaded_file.name)
 
-    return "PDF was processed and indexed in the vector database."
+    return (
+        f"'{uploaded_file.name}' was processed: {stats['chunks']} text chunks from "
+        f"{stats['pages']} pages indexed and ready to chat. Figures are being described "
+        "in the background and will become searchable within a few minutes."
+    )
 
 
 #
-# Sends the user question to the available RAG pipeline and returns the generated answer.
-def get_rag_answer(question: str) -> str:
+# Lists the documents that are currently indexed in the vector database.
+def get_indexed_sources() -> list[str]:
+    if pipeline is None:
+        return []
+    return pipeline.list_sources()
+
+
+#
+# Sends the user question to the RAG pipeline and returns answer + sources.
+def get_rag_result(question: str) -> dict:
     """
-    Generate an answer with whichever RAG interface is currently available.
-
-    Compatibility paths:
-    1. Old backend: answer_question_with_rag(question, document_text)
-    2. New backend: pipeline.ask(question)
-    3. New backend alternative: GWDGRagPipeline().ask(question)
+    Returns {"answer": str | generator, "sources": list[dict]}. The question is
+    scoped to the document selected in the sidebar (st.session_state.active_source),
+    and the recent chat history is passed along for follow-up questions.
     """
-    if answer_question_with_rag is not None:
-        return answer_question_with_rag(question, st.session_state.extracted_text)
-
-    active_pipeline = pipeline
-
-    if active_pipeline is None and GWDGRagPipeline is not None:
-        active_pipeline = GWDGRagPipeline()
-
-    if active_pipeline is not None:
-        if hasattr(active_pipeline, "ask"):
-            return active_pipeline.ask(question)
-        if hasattr(active_pipeline, "answer_question_with_rag"):
-            return active_pipeline.answer_question_with_rag(question)
-
-    return "Error: No compatible RAG pipeline function was found. Please check rag_pipeline.py."
+    # Die letzten Chat-Nachrichten (ohne die gerade gestellte Frage) als Kontext
+    history = [
+        {"role": message["role"], "content": message["content"]}
+        for message in st.session_state.messages[:-1]
+    ]
+    return pipeline.answer(
+        question,
+        source=st.session_state.active_source,
+        history=history,
+        stream=True,
+    )
 
 
 # Displays the main app header shown above the chat area.
@@ -497,7 +538,23 @@ st.markdown(
 
 
 #
-# Builds the sidebar control panel for PDF upload, processing status, chat reset, and JSON export.
+# Without a working pipeline (e.g. missing .env values) the app cannot do anything;
+# show the real error instead of failing silently later.
+if pipeline is None:
+    st.error(
+        f"The RAG pipeline could not be initialized: {pipeline_error}\n\n"
+        "Check the .env file (SAIA_API_KEY, SAIA_BASE_URL, SAIA_MODEL) and restart the app."
+    )
+    st.stop()
+
+
+#
+# The list of documents currently in the vector database drives upload skipping,
+# the document selector, and the chat gate.
+indexed_sources = get_indexed_sources()
+
+#
+# Builds the sidebar control panel for PDF upload, document management, chat reset, and JSON export.
 with st.sidebar:
     st.header("📄 Control Panel")
     st.caption("Upload a report and chat with its content.")
@@ -507,15 +564,33 @@ with st.sidebar:
         type=["pdf"],
     )
 
+    if uploaded_file is None:
+        # Once the deleted file is removed from the uploader, it may be re-uploaded again.
+        st.session_state.just_deleted_source = None
+
     if uploaded_file is not None:
-        if uploaded_file.name != st.session_state.uploaded_file_name:
-            with st.spinner("Processing PDF and preparing RAG index..."):
-                st.session_state.extracted_text = process_uploaded_pdf(uploaded_file)
+        if uploaded_file.name == st.session_state.just_deleted_source:
+            st.info(
+                "This document was just deleted. Remove the file from the upload "
+                "field first if you want to re-index it."
+            )
+        elif uploaded_file.name not in indexed_sources:
+            with st.spinner("Processing PDF: chunking and indexing text..."):
+                st.session_state.processing_status = process_uploaded_pdf(uploaded_file)
 
             st.session_state.uploaded_file_name = uploaded_file.name
             st.session_state.pdf_processed = True
             st.session_state.messages = []
             st.session_state.json_export = None
+            indexed_sources = get_indexed_sources()
+        elif uploaded_file.name != st.session_state.uploaded_file_name:
+            # Already indexed (e.g. from an earlier session): only load the page preview.
+            # If figure captioning never finished (e.g. interrupted upload), resume it
+            # in the background; the summary stays lazy either way.
+            st.session_state.page_texts = extract_page_texts_from_pdf(uploaded_file)
+            st.session_state.uploaded_file_name = uploaded_file.name
+            st.session_state.processing_status = f"'{uploaded_file.name}' is already indexed."
+            pipeline.ensure_document_images(uploaded_file.name)
 
         st.success("PDF uploaded successfully.")
         st.markdown(
@@ -523,7 +598,7 @@ with st.sidebar:
             <div class='status-card'>
                 <span class='status-badge'>PDF READY</span>
                 <span class='status-badge'>RAG ACTIVE</span>
-                <span class='status-badge'>GEMMA 4</span>
+                <span class='status-badge'>VISION</span>
                 <br><br>
                 <strong>File:</strong> {uploaded_file.name}
             </div>
@@ -531,15 +606,49 @@ with st.sidebar:
             unsafe_allow_html=True,
         )
 
-        if st.session_state.extracted_text:
+        if st.session_state.processing_status:
             with st.expander("PDF processing preview"):
                 st.text_area(
                     "Preview / status",
-                    st.session_state.extracted_text[:3000],
+                    st.session_state.processing_status[:3000],
                     height=250,
                 )
         else:
             st.warning("No text or index status could be created from this PDF.")
+
+    #
+    # Document management: choose which document questions refer to, delete old ones.
+    if indexed_sources:
+        st.divider()
+        st.subheader("🎯 Documents")
+
+        scope_options = ["All documents"] + indexed_sources
+        selected_scope = st.selectbox(
+            "Answer questions using:",
+            scope_options,
+            key="active_source_select",
+        )
+        st.session_state.active_source = (
+            None if selected_scope == "All documents" else selected_scope
+        )
+
+        st.caption("Indexed documents:")
+        for source_name in indexed_sources:
+            name_column, delete_column = st.columns([5, 1])
+            label = source_name
+            if pipeline.is_indexing_images(source_name):
+                label += " · 🖼️ describing figures…"
+            name_column.caption(label)
+            if delete_column.button("🗑️", key=f"delete_{source_name}", help=f"Delete {source_name}"):
+                PDFProcessor().delete_pdf(source_name)
+                st.session_state.just_deleted_source = source_name
+                if st.session_state.uploaded_file_name == source_name:
+                    st.session_state.uploaded_file_name = None
+                    st.session_state.processing_status = ""
+                    st.session_state.page_texts = {}
+                st.rerun()
+    else:
+        st.session_state.active_source = None
 
     if st.button("Clear chat"):
         st.session_state.messages = []
@@ -547,31 +656,29 @@ with st.sidebar:
     st.divider()
     st.subheader("📦 JSON Export")
 
-    if create_json_export is None or convert_json_export_to_string is None:
-        st.caption("JSON export is currently disabled because json_export.py is not compatible with the latest RAG pipeline.")
-    elif st.session_state.extracted_text:
+    if not indexed_sources:
+        st.caption("Upload a PDF first to enable JSON export.")
+    elif st.session_state.active_source is None:
+        st.caption("Select a specific document above to enable JSON export.")
+    else:
         if st.button("Generate sustainability JSON"):
             with st.spinner("Extracting structured sustainability data..."):
-                st.session_state.json_export = create_json_export(
-                    st.session_state.extracted_text
-                )
+                st.session_state.json_export = {
+                    "document": st.session_state.active_source,
+                    "data": create_json_export(pipeline, st.session_state.active_source),
+                }
 
-        if st.session_state.json_export is not None:
-            json_export_string = convert_json_export_to_string(
-                st.session_state.json_export
-            )
-
+        export = st.session_state.json_export
+        if export is not None and export.get("document") == st.session_state.active_source:
             st.download_button(
                 label="Download JSON",
-                data=json_export_string,
-                file_name="sustainability_export.json",
+                data=convert_json_export_to_string(export["data"]),
+                file_name=f"{Path(export['document']).stem}_sustainability.json",
                 mime="application/json",
             )
 
             with st.expander("Preview JSON"):
-                st.json(st.session_state.json_export)
-    else:
-        st.caption("Upload a PDF first to enable JSON export.")
+                st.json(export["data"])
 
     st.divider()
     st.caption("System status")
@@ -581,8 +688,12 @@ with st.sidebar:
 
 
 #
-# Shows a status box that tells the user whether a PDF has already been loaded.
-if not st.session_state.extracted_text:
+# Shows a status box that tells the user whether documents are ready for the chat.
+# The chat works as soon as the vector database contains at least one document,
+# even after an app restart without a fresh upload.
+documents_ready = bool(indexed_sources) or bool(st.session_state.processing_status)
+
+if not documents_ready:
     st.markdown(
         """
         <div class='chat-info-box'>
@@ -593,11 +704,12 @@ if not st.session_state.extracted_text:
         unsafe_allow_html=True,
     )
 else:
+    active_scope = st.session_state.active_source or "all uploaded documents"
     st.markdown(
-        """
+        f"""
         <div class='chat-info-box'>
         <strong>Document is ready.</strong><br>
-        Ask a question below. The app retrieves relevant sections and sends them to SAIA/Gemma.
+        Ask a question below. Answers are based on: <strong>{html.escape(active_scope)}</strong>.
         </div>
         """,
         unsafe_allow_html=True,
@@ -607,7 +719,7 @@ else:
 #
 # Re-renders the stored chat history after every Streamlit rerun.
 for message in st.session_state.messages:
-    render_chat_bubble(message["role"], message["content"])
+    render_chat_bubble(message["role"], message["content"], message.get("sources"))
 
 
 #
@@ -617,7 +729,7 @@ user_question = st.chat_input("Ask a question about the PDF...")
 #
 # Handles a new user question: store it, query the RAG pipeline, render the answer, and save it to chat history.
 if user_question:
-    if not st.session_state.extracted_text:
+    if not documents_ready:
         st.warning("Please upload a PDF first.")
     else:
         st.session_state.messages.append(
@@ -626,13 +738,31 @@ if user_question:
 
         render_chat_bubble("user", user_question)
 
-        with st.spinner("Searching relevant PDF sections and generating answer with SAIA/Gemma..."):
-            raw_answer = get_rag_answer(user_question)
+        if is_summary_question(user_question) and not pipeline.has_summary(st.session_state.active_source):
+            spinner_text = "Generating document summary (first time for this document, can take a bit)..."
+        else:
+            spinner_text = "Searching and re-ranking relevant PDF sections..."
 
-        answer = clean_message_content(raw_answer)
+        with st.spinner(spinner_text):
+            result = get_rag_result(user_question)
 
-        render_chat_bubble("assistant", answer)
+        raw_answer = result["answer"]
+
+        # Antwort streamen (Generator) oder direkt anzeigen (fertiger String)
+        with st.chat_message("assistant", avatar="🌱"):
+            if isinstance(raw_answer, str):
+                answer_text = raw_answer
+                st.write(answer_text)
+            else:
+                answer_text = st.write_stream(raw_answer)
 
         st.session_state.messages.append(
-            {"role": "assistant", "content": answer}
+            {
+                "role": "assistant",
+                "content": clean_message_content(str(answer_text)),
+                "sources": result.get("sources", []),
+            }
         )
+
+        # Neu rendern, damit die Antwort mit Quellen-Pills und Expander erscheint
+        st.rerun()
