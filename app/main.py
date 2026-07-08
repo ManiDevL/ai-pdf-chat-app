@@ -1,6 +1,7 @@
 
 import html
 import re
+import time
 from io import BytesIO
 from pathlib import Path
 
@@ -176,10 +177,15 @@ st.markdown(
     }
 
     /* Stable bubble styling for Streamlit's built-in chat component.
-       We only style Streamlit elements here; we do not store custom HTML in chat history. */
+       We only style Streamlit elements here; we do not store custom HTML in chat history.
+       Streamlit's chat message no longer exposes a stChatMessageAvatarUser/-Assistant
+       testid - the role instead lives in the aria-label of stChatMessageContent, so the
+       left/right alignment below keys off that. */
     div[data-testid="stChatMessage"] {
+        display: flex;
         width: fit-content;
         max-width: 76%;
+        min-width: 0;
         background: rgba(255, 255, 255, 0.10);
         border: 1px solid rgba(255, 255, 255, 0.14);
         border-radius: 1rem;
@@ -188,16 +194,30 @@ st.markdown(
         box-shadow: 0 8px 22px rgba(0, 0, 0, 0.18);
     }
 
-    div[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) {
+    div[data-testid="stChatMessage"]:has(
+        [data-testid="stChatMessageContent"][aria-label="Chat message from user"]
+    ) {
         margin-left: auto;
         background: linear-gradient(135deg, #10b981 0%, #059669 100%);
         border: 1px solid rgba(167, 243, 208, 0.35);
     }
 
-    div[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"]) {
+    div[data-testid="stChatMessage"]:has(
+        [data-testid="stChatMessageContent"][aria-label="Chat message from assistant"]
+    ) {
         margin-right: auto;
         background: rgba(255, 255, 255, 0.10);
         border: 1px solid rgba(255, 255, 255, 0.14);
+    }
+
+    /* Long unbroken strings (e.g. PDF text extracted without spaces between words)
+       must wrap inside the bubble instead of forcing it wider than the chat column. */
+    div[data-testid="stChatMessage"],
+    div[data-testid="stChatMessage"] [data-testid="stChatMessageContent"],
+    div[data-testid="stChatMessage"] p,
+    div[data-testid="stChatMessage"] li {
+        overflow-wrap: anywhere;
+        word-break: break-word;
     }
 
     div[data-testid="stChatMessage"] p {
@@ -265,6 +285,22 @@ except Exception as e:
 
 
 
+# Streamlit's markdown renderer treats "$...$" as inline LaTeX (KaTeX), and sustainability
+# reports are full of dollar figures like "$1.2 billion". Depending on what's between two
+# dollar signs, this either shows an ugly raw math/code fallback or - worse - KaTeX actually
+# renders it as math, where TeX silently drops all whitespace between "variables" (i.e. the
+# words), producing exactly the squashed-together, overflowing text reported in the chat.
+#
+# Only escape a "$" that is immediately followed by a digit - that is always a currency
+# amount ("$1.2 billion", "$100 million"), never the start of real LaTeX (which starts with
+# a command like "\text{...}" or a letter). This leaves genuine formulas the model writes,
+# e.g. "$\text{CO}_2\text{e}$" for CO2e, untouched so KaTeX still renders them properly,
+# while neutralizing the currency case that actually breaks the chat layout. The negative
+# lookbehind makes this idempotent, so it's safe to call on text that may already be escaped.
+def escape_math_delimiters(text: str) -> str:
+    return re.sub(r"(?<!\\)\$(?=\d)", r"\\$", text)
+
+
 # Cleans assistant and user messages before rendering, removing old HTML fragments and unsafe markup.
 def clean_message_content(content: str) -> str:
     content = html.unescape(str(content)).strip()
@@ -297,7 +333,7 @@ def clean_message_content(content: str) -> str:
     content = re.sub(r"<br\s*/?>", "\n", content)
     content = re.sub(r"<[^>]+>", "", content)
 
-    return content.strip()
+    return escape_math_delimiters(content.strip())
 
 
 #
@@ -355,13 +391,17 @@ def split_answer_and_sources(content: str) -> tuple[str, str]:
 
 #
 # Renders each chat message and adds expandable source previews for assistant answers.
-def render_chat_bubble(role: str, content: str, sources: list | None = None) -> None:
+def render_chat_bubble(
+    role: str, content: str, sources: list | None = None, response_time: float | None = None
+) -> None:
     """
     Render chat messages with Streamlit's stable built-in chat component.
 
     Assistant messages carry structured source metadata from the RAG pipeline
     (document, page, relevance, optional figure image). Older messages without
-    metadata fall back to parsing the citation text.
+    metadata fall back to parsing the citation text. response_time (seconds, wall-clock
+    from the user sending the question to the full answer being ready) is only present for
+    assistant messages generated after this feature was added; older history has none.
     """
     content = clean_message_content(content)
 
@@ -392,6 +432,9 @@ def render_chat_bubble(role: str, content: str, sources: list | None = None) -> 
             st.caption(f"📄 {source_label}")
         st.write(display_content)
 
+        if response_time is not None:
+            st.caption(f"⏱️ Response time: {response_time:.1f}s")
+
         if sources:
             with st.expander("Show sources"):
                 for entry in sources:
@@ -414,7 +457,8 @@ def render_chat_bubble(role: str, content: str, sources: list | None = None) -> 
 
                     entry_text = entry.get("text", "")
                     if entry_text:
-                        st.write(entry_text[:600] + ("…" if len(entry_text) > 600 else ""))
+                        preview = entry_text[:600] + ("…" if len(entry_text) > 600 else "")
+                        st.write(escape_math_delimiters(preview))
                     st.divider()
         else:
             # Fallback für ältere Nachrichten ohne gespeicherte Quellen-Metadaten
@@ -425,7 +469,7 @@ def render_chat_bubble(role: str, content: str, sources: list | None = None) -> 
                         page_text = st.session_state.page_texts.get(page_number, "")
                         st.caption(f"Page {page_number}")
                         if page_text:
-                            st.write(page_text[:1500])
+                            st.write(escape_math_delimiters(page_text[:1500]))
                         else:
                             st.caption("No extracted text available.")
 
@@ -755,7 +799,9 @@ else:
 #
 # Re-renders the stored chat history after every Streamlit rerun.
 for message in st.session_state.messages:
-    render_chat_bubble(message["role"], message["content"], message.get("sources"))
+    render_chat_bubble(
+        message["role"], message["content"], message.get("sources"), message.get("response_time")
+    )
 
 
 #
@@ -772,6 +818,9 @@ if user_question:
     if not documents_ready:
         st.warning("Please upload a PDF first.")
     else:
+        # Für spätere Benchmarks: Zeit ab dem Absenden der Frage bis zur fertigen Antwort.
+        request_started_at = time.perf_counter()
+
         st.session_state.messages.append(
             {"role": "user", "content": user_question}
         )
@@ -791,21 +840,28 @@ if user_question:
 
         raw_answer = result["answer"]
 
-        # Antwort streamen (Generator) oder direkt anzeigen (fertiger String)
+        # Antwort streamen (Generator) oder direkt anzeigen (fertiger String). Dollar-Zeichen
+        # werden schon hier escaped (nicht erst in clean_message_content), sonst würde die
+        # erste Anzeige während des Streamings kurz als falsch gerenderte LaTeX-Formel
+        # erscheinen, bevor der anschließende Rerun sie korrigiert.
         with st.chat_message("assistant", avatar="🌱"):
             if isinstance(raw_answer, str):
-                answer_text = raw_answer
+                answer_text = escape_math_delimiters(raw_answer)
                 st.write(answer_text)
             else:
-                answer_text = st.write_stream(raw_answer)
+                answer_text = st.write_stream(
+                    escape_math_delimiters(token) for token in raw_answer
+                )
 
         st.session_state.messages.append(
             {
                 "role": "assistant",
                 "content": clean_message_content(str(answer_text)),
                 "sources": result.get("sources", []),
+                "response_time": time.perf_counter() - request_started_at,
             }
         )
 
-        # Neu rendern, damit die Antwort mit Quellen-Pills und Expander erscheint
+        # Neu rendern, damit die Antwort mit Quellen-Pills, Response-Time-Anzeige und
+        # Expander erscheint.
         st.rerun()

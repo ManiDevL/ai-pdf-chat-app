@@ -98,7 +98,9 @@ def convert_json_export_to_string(export_data: dict | list) -> str:
 def create_chat_history_export(messages: list[dict]) -> list[dict]:
     """Paart jede Nutzerfrage mit der direkt folgenden Assistenzantwort für den Export.
 
-    Nimmt st.session_state.messages entgegen (Liste aus {"role", "content", "sources"}).
+    Nimmt st.session_state.messages entgegen (Liste aus {"role", "content", "sources",
+    "response_time"}). response_time (Sekunden, ab Absenden der Frage bis zur fertigen
+    Antwort) fehlt bei Nachrichten aus der Zeit vor diesem Feature - dann steht null im Export.
     """
     turns = []
     pending_question = None
@@ -112,6 +114,7 @@ def create_chat_history_export(messages: list[dict]) -> list[dict]:
                 {
                     "question": pending_question,
                     "answer": content,
+                    "response_time_seconds": message.get("response_time"),
                     "sources": [
                         {"source": entry.get("source"), "page": entry.get("page")}
                         for entry in (message.get("sources") or [])
