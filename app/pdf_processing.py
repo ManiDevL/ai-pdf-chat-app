@@ -25,6 +25,9 @@ EMBEDDING_MODEL = "intfloat/multilingual-e5-base"
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 150
 
+# Batchgröße beim lokalen Neu-Embedden nach einem Embedding-Modell-Wechsel
+REEMBED_BATCH_SIZE = 128
+
 # Bilder unterhalb dieser Kantenlänge (Logos, Icons, Deko) werden übersprungen
 MIN_IMAGE_SIZE = 100
 
@@ -71,17 +74,81 @@ def embed_query(text: str) -> list[float]:
     return vector.tolist()
 
 
-def get_collection(chroma_client):
-    """Öffnet bzw. erstellt die zentrale Collection mit einheitlicher Konfiguration.
+def _stored_collection_dimension(collection) -> int | None:
+    """Liest die Embedding-Dimension, mit der die Collection ursprünglich befüllt wurde.
 
-    Cosine-Distanz passt zu den normalisierten bge-m3-Embeddings; der Helper stellt
-    sicher, dass PDFProcessor und RAG-Pipeline identische Einstellungen verwenden.
+    Chroma friert die Dimension beim ersten Insert dauerhaft ein - auch wenn die
+    Collection später geleert wird. Sie steht nur im privaten Collection-Modell;
+    als Fallback (falls sich das Attribut in künftigen Chroma-Versionen ändert)
+    wird die Länge des ersten gespeicherten Embeddings genommen.
     """
-    return chroma_client.get_or_create_collection(
+    dimension = getattr(getattr(collection, "_model", None), "dimension", None)
+    if dimension:
+        return int(dimension)
+
+    probe = collection.get(limit=1, include=["embeddings"])
+    embeddings = probe["embeddings"]
+    if probe["ids"] and embeddings is not None and len(embeddings) > 0:
+        return len(embeddings[0])
+    return None
+
+
+def _rebuild_collection(chroma_client, old_collection):
+    """Baut die Collection nach einem Embedding-Modell-Wechsel neu auf.
+
+    Alle gespeicherten Texte (Text-Chunks, Bildbeschreibungen, Zusammenfassungen)
+    bleiben erhalten und werden lokal mit dem aktuellen Modell neu embeddet -
+    es fallen keine LLM-/API-Aufrufe an, nur CPU-Zeit.
+    """
+    data = old_collection.get(include=["documents", "metadatas"])
+    chroma_client.delete_collection(COLLECTION_NAME)
+    collection = chroma_client.get_or_create_collection(
         name=COLLECTION_NAME,
         embedding_function=get_embedding_function(),
         metadata={"hnsw:space": "cosine"},
     )
+
+    for start in range(0, len(data["ids"]), REEMBED_BATCH_SIZE):
+        end = start + REEMBED_BATCH_SIZE
+        collection.upsert(
+            ids=data["ids"][start:end],
+            documents=data["documents"][start:end],
+            metadatas=data["metadatas"][start:end],
+        )
+
+    print(f"Collection neu aufgebaut: {len(data['ids'])} Einträge lokal neu embeddet.")
+    return collection
+
+
+def get_collection(chroma_client):
+    """Öffnet bzw. erstellt die zentrale Collection mit einheitlicher Konfiguration.
+
+    Cosine-Distanz passt zu den normalisierten Embeddings; der Helper stellt
+    sicher, dass PDFProcessor und RAG-Pipeline identische Einstellungen verwenden.
+
+    Wurde die Collection mit einem anderen Embedding-Modell aufgebaut (erkennbar an
+    einer anderen Vektordimension), wird sie automatisch neu aufgebaut. Ohne das
+    lehnt Chroma nach einem Modellwechsel dauerhaft jede Suche und jeden Insert ab
+    ("Collection expecting embedding with dimension of X, got Y") - selbst dann
+    noch, wenn die Collection inzwischen komplett geleert wurde.
+    """
+    embedding_function = get_embedding_function()
+    collection = chroma_client.get_or_create_collection(
+        name=COLLECTION_NAME,
+        embedding_function=embedding_function,
+        metadata={"hnsw:space": "cosine"},
+    )
+
+    model_dimension = embedding_function._model.get_embedding_dimension()
+    stored_dimension = _stored_collection_dimension(collection)
+    if stored_dimension is not None and stored_dimension != model_dimension:
+        print(
+            f"Embedding-Modell geändert (Dimension {stored_dimension} -> {model_dimension}): "
+            f"Collection '{COLLECTION_NAME}' wird neu aufgebaut ..."
+        )
+        with DB_WRITE_LOCK:
+            collection = _rebuild_collection(chroma_client, collection)
+    return collection
 
 
 def _is_noise_block(raw_text: str) -> bool:

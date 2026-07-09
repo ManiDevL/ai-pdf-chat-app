@@ -6,6 +6,7 @@ from io import BytesIO
 from pathlib import Path
 
 import streamlit as st
+from openai import APIConnectionError, APIStatusError, RateLimitError
 
 
 from json_export import create_json_export, convert_json_export_to_string, create_chat_history_export
@@ -835,33 +836,50 @@ if user_question:
         else:
             spinner_text = "Searching and re-ranking relevant PDF sections..."
 
-        with st.spinner(spinner_text):
-            result = get_rag_result(user_question)
+        # SAIA-/API-Fehler (Rate Limit, Server nicht erreichbar) dürfen die App nicht mit
+        # einem Stacktrace crashen: Frage wieder aus der Historie nehmen (damit sie nach
+        # dem Warten einfach neu gestellt werden kann) und einen klaren Hinweis anzeigen.
+        try:
+            with st.spinner(spinner_text):
+                result = get_rag_result(user_question)
 
-        raw_answer = result["answer"]
+            raw_answer = result["answer"]
 
-        # Antwort streamen (Generator) oder direkt anzeigen (fertiger String). Dollar-Zeichen
-        # werden schon hier escaped (nicht erst in clean_message_content), sonst würde die
-        # erste Anzeige während des Streamings kurz als falsch gerenderte LaTeX-Formel
-        # erscheinen, bevor der anschließende Rerun sie korrigiert.
-        with st.chat_message("assistant", avatar="🌱"):
-            if isinstance(raw_answer, str):
-                answer_text = escape_math_delimiters(raw_answer)
-                st.write(answer_text)
-            else:
-                answer_text = st.write_stream(
-                    escape_math_delimiters(token) for token in raw_answer
-                )
+            # Antwort streamen (Generator) oder direkt anzeigen (fertiger String). Dollar-Zeichen
+            # werden schon hier escaped (nicht erst in clean_message_content), sonst würde die
+            # erste Anzeige während des Streamings kurz als falsch gerenderte LaTeX-Formel
+            # erscheinen, bevor der anschließende Rerun sie korrigiert.
+            with st.chat_message("assistant", avatar="🌱"):
+                if isinstance(raw_answer, str):
+                    answer_text = escape_math_delimiters(raw_answer)
+                    st.write(answer_text)
+                else:
+                    answer_text = st.write_stream(
+                        escape_math_delimiters(token) for token in raw_answer
+                    )
+        except RateLimitError:
+            st.session_state.messages.pop()
+            st.warning(
+                "⏳ The SAIA API rate limit is currently exceeded (quota used up or too many "
+                "requests in a short time). Your documents and the index are not affected — "
+                "wait a moment and ask again."
+            )
+        except (APIConnectionError, APIStatusError) as api_error:
+            st.session_state.messages.pop()
+            st.error(
+                f"The SAIA API request failed: {api_error}\n\n"
+                "Check your internet connection and the .env settings, then try again."
+            )
+        else:
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": clean_message_content(str(answer_text)),
+                    "sources": result.get("sources", []),
+                    "response_time": time.perf_counter() - request_started_at,
+                }
+            )
 
-        st.session_state.messages.append(
-            {
-                "role": "assistant",
-                "content": clean_message_content(str(answer_text)),
-                "sources": result.get("sources", []),
-                "response_time": time.perf_counter() - request_started_at,
-            }
-        )
-
-        # Neu rendern, damit die Antwort mit Quellen-Pills, Response-Time-Anzeige und
-        # Expander erscheint.
-        st.rerun()
+            # Neu rendern, damit die Antwort mit Quellen-Pills, Response-Time-Anzeige und
+            # Expander erscheint.
+            st.rerun()
